@@ -1,5 +1,7 @@
+import json
 import re
 import threading
+import time
 from collections import Counter
 from urllib.parse import quote_plus
 
@@ -8,11 +10,14 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 
 REGISTRATION = "SP23-BAI-044"
 NEWS_SOURCE = "ProPakistani"
-SEARCH_URL = "https://propakistani.pk/?s={}"
+HOME = "https://propakistani.pk/"
+REST_SEARCH = HOME + "wp-json/wp/v2/posts?search={}&per_page=5&_fields=link"
+ARTICLE_RE = re.compile(r"^https?://(www\.)?propakistani\.pk/\d{4}/\d{2}/\d{2}/[^/?#]+/?$")
 
 app = Flask(__name__)
 driver_lock = threading.Lock()  # one Chrome at a time (small server)
@@ -49,44 +54,101 @@ def make_driver():
     return d
 
 
-def find_first_result(driver, keyword):
-    driver.get(SEARCH_URL.format(quote_plus(keyword)))
-    selectors = [
-        "article h2 a",
-        "h2.entry-title a",
-        "h3.entry-title a",
-        "h2.post-title a",
-        "h3.post-title a",
-        "main h2 a",
-        "main h3 a",
-        "h2 a",
-        "h3 a",
-    ]
+def article_links(driver, scope="a[href]"):
+    out = []
+    for el in driver.find_elements(By.CSS_SELECTOR, scope):
+        try:
+            href = el.get_attribute("href")
+        except Exception:
+            continue
+        if href and ARTICLE_RE.match(href) and href not in out:
+            out.append(href)
+    return out
 
-    def good(href):
-        return (
-            href
-            and "propakistani.pk" in href
-            and "?s=" not in href
-            and "/category/" not in href
-            and "/tag/" not in href
-            and "/author/" not in href
-            and "/page/" not in href
-            and href.rstrip("/") != "https://propakistani.pk"
-        )
 
-    def locate(d):
-        for sel in selectors:
-            for el in d.find_elements(By.CSS_SELECTOR, sel):
-                href = el.get_attribute("href")
-                if good(href):
-                    return href
-        return False
+def search_via_rest(driver, keyword):
+    """Strategy 1: the site's WordPress search endpoint, opened in Chrome."""
+    driver.get(REST_SEARCH.format(quote_plus(keyword)))
+    body = driver.find_element(By.TAG_NAME, "body").text.strip()
+    data = json.loads(body)
+    for post in data:
+        link = post.get("link", "")
+        if ARTICLE_RE.match(link):
+            return link
+    return None
 
-    try:
-        return WebDriverWait(driver, 20).until(locate)
-    except Exception:
+
+def search_via_ui(driver, keyword):
+    """Strategy 2: type the keyword into the site's own search box."""
+    driver.get(HOME)
+    time.sleep(2)
+    baseline = set(article_links(driver))
+
+    input_css = "input[type='search'], input[name='s'], input[placeholder*='earch' i]"
+
+    def visible_input():
+        for el in driver.find_elements(By.CSS_SELECTOR, input_css):
+            try:
+                if el.is_displayed() and el.is_enabled():
+                    return el
+            except Exception:
+                pass
         return None
+
+    box = visible_input()
+    if not box:
+        togglers = driver.find_elements(
+            By.CSS_SELECTOR,
+            "[class*='search' i], [id*='search' i], button[aria-label*='earch' i], a[href='#search']",
+        )
+        for t in togglers[:12]:
+            try:
+                driver.execute_script("arguments[0].click();", t)
+                time.sleep(0.7)
+                box = visible_input()
+                if box:
+                    break
+            except Exception:
+                continue
+    if not box:
+        return None
+
+    box.clear()
+    box.send_keys(keyword)
+    box.send_keys(Keys.ENTER)
+
+    end = time.time() + 12
+    while time.time() < end:
+        time.sleep(1)
+        if "not found" in (driver.title or "").lower():
+            return None
+        fresh = [l for l in article_links(driver) if l not in baseline]
+        if fresh:
+            return fresh[0]
+    return None
+
+
+def search_via_tag(driver, keyword):
+    """Strategy 3: the tag archive page for the keyword."""
+    slug = re.sub(r"[^a-z0-9]+", "-", keyword.lower()).strip("-")
+    if not slug:
+        return None
+    driver.get(f"{HOME}tag/{slug}/")
+    if "not found" in (driver.title or "").lower():
+        return None
+    links = article_links(driver, "main a[href], #content a[href], article a[href]")
+    return links[0] if links else None
+
+
+def find_first_result(driver, keyword):
+    for strategy in (search_via_rest, search_via_ui, search_via_tag):
+        try:
+            url = strategy(driver, keyword)
+            if url:
+                return url
+        except Exception:
+            continue
+    return None
 
 
 def get_article_text(driver, url):
@@ -96,7 +158,10 @@ def get_article_text(driver, url):
     )
     for sel in [".entry-content p", ".post-content p", "article p", "main p", "p"]:
         paras = [p.text.strip() for p in driver.find_elements(By.CSS_SELECTOR, sel)]
-        paras = [p for p in paras if len(p.split()) >= 8]
+        paras = [
+            p for p in paras
+            if len(p.split()) >= 8 and "stay connected with propakistani" not in p.lower()
+        ]
         if len(paras) >= 2:
             return " ".join(paras)
     return ""
