@@ -1,9 +1,10 @@
 import json
 import re
+import sys
 import threading
 import time
 from collections import Counter
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 from flask import Flask, jsonify, request
 from selenium import webdriver
@@ -21,6 +22,15 @@ ARTICLE_RE = re.compile(r"^https?://(www\.)?propakistani\.pk/\d{4}/\d{2}/\d{2}/[
 
 app = Flask(__name__)
 driver_lock = threading.Lock()  # one Chrome at a time (small server)
+
+
+class Blocked(Exception):
+    """Raised when the site shows a bot-check page that does not clear."""
+
+
+def log(*args):
+    print(*args, file=sys.stderr, flush=True)
+
 
 STOPWORDS = set(
     "a an the and or but if then else of to in on at by for with from as is are was were be been being "
@@ -43,15 +53,41 @@ def make_driver():
     opts.add_argument("--disable-background-networking")
     opts.add_argument("--remote-debugging-port=9222")
     opts.add_argument("--window-size=1366,768")
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-    )
+    opts.add_argument("--lang=en-US")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
     opts.page_load_strategy = "eager"
     service = Service("/usr/local/bin/chromedriver")
     d = webdriver.Chrome(service=service, options=opts)
     d.set_page_load_timeout(40)
+    try:
+        # look like a normal Chrome: no "HeadlessChrome", no navigator.webdriver
+        ua = d.execute_script("return navigator.userAgent").replace("HeadlessChrome", "Chrome")
+        d.execute_cdp_cmd("Network.setUserAgentOverride", {"userAgent": ua, "acceptLanguage": "en-US,en"})
+        d.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"},
+        )
+    except Exception as e:
+        log("stealth setup failed:", e)
     return d
+
+
+def is_challenge(driver):
+    t = (driver.title or "").lower()
+    return "just a moment" in t or "attention required" in t or "access denied" in t
+
+
+def wait_clear(driver, timeout=15):
+    """Wait for a Cloudflare-style check page to go away."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if not is_challenge(driver):
+            return
+        time.sleep(1)
+    if is_challenge(driver):
+        raise Blocked("bot-check page did not clear")
 
 
 def article_links(driver, scope="a[href]"):
@@ -69,6 +105,7 @@ def article_links(driver, scope="a[href]"):
 def search_via_rest(driver, keyword):
     """Strategy 1: the site's WordPress search endpoint, opened in Chrome."""
     driver.get(REST_SEARCH.format(quote_plus(keyword)))
+    wait_clear(driver)
     body = driver.find_element(By.TAG_NAME, "body").text.strip()
     data = json.loads(body)
     for post in data:
@@ -81,6 +118,7 @@ def search_via_rest(driver, keyword):
 def search_via_ui(driver, keyword):
     """Strategy 2: type the keyword into the site's own search box."""
     driver.get(HOME)
+    wait_clear(driver)
     time.sleep(2)
     baseline = set(article_links(driver))
 
@@ -134,25 +172,63 @@ def search_via_tag(driver, keyword):
     if not slug:
         return None
     driver.get(f"{HOME}tag/{slug}/")
+    wait_clear(driver)
     if "not found" in (driver.title or "").lower():
         return None
     links = article_links(driver, "main a[href], #content a[href], article a[href]")
     return links[0] if links else None
 
 
+def search_via_ddg(driver, keyword):
+    """Last resort: search engine restricted to propakistani.pk. Returns (url, snippet)."""
+    q = quote_plus(f"site:propakistani.pk {keyword}")
+    driver.get(f"https://html.duckduckgo.com/html/?q={q}")
+    time.sleep(2)
+    for res in driver.find_elements(By.CSS_SELECTOR, ".result"):
+        try:
+            a = res.find_element(By.CSS_SELECTOR, "a.result__a")
+            href = a.get_attribute("href") or ""
+            if "uddg=" in href:
+                href = unquote(parse_qs(urlparse(href).query).get("uddg", [""])[0])
+            if not ARTICLE_RE.match(href):
+                continue
+            snippet = ""
+            try:
+                snippet = res.find_element(By.CSS_SELECTOR, ".result__snippet").text.strip()
+            except Exception:
+                pass
+            return href, snippet
+        except Exception:
+            continue
+    return None, ""
+
+
 def find_first_result(driver, keyword):
+    """Returns (url, fallback_snippet)."""
+    blocked = False
     for strategy in (search_via_rest, search_via_ui, search_via_tag):
         try:
             url = strategy(driver, keyword)
             if url:
-                return url
-        except Exception:
-            continue
-    return None
+                return url, ""
+        except Blocked:
+            log(strategy.__name__, "blocked by bot check")
+            blocked = True
+            break  # other strategies hit the same wall
+        except Exception as e:
+            log(strategy.__name__, "failed:", type(e).__name__, str(e)[:150])
+    try:
+        url, snippet = search_via_ddg(driver, keyword)
+        if url:
+            return url, snippet
+    except Exception as e:
+        log("search_via_ddg failed:", type(e).__name__, str(e)[:150])
+    return None, ""
 
 
 def get_article_text(driver, url):
     driver.get(url)
+    wait_clear(driver)
     WebDriverWait(driver, 20).until(
         lambda d: d.find_elements(By.CSS_SELECTOR, "article p, .entry-content p, p")
     )
@@ -217,14 +293,21 @@ def get_news():
         driver = None
         try:
             driver = make_driver()
-            url = find_first_result(driver, keyword)
+            url, snippet = find_first_result(driver, keyword)
             if not url:
                 result["summary"] = "No search results found"
                 return jsonify(result), 404
             result["url"] = url
-            text = get_article_text(driver, url)
-            result["summary"] = summarize(text) or "Could not extract article text"
+            text = ""
+            try:
+                text = get_article_text(driver, url)
+            except Blocked:
+                log("article page blocked by bot check, using search snippet")
+            except Exception as e:
+                log("article fetch failed:", type(e).__name__, str(e)[:150])
+            result["summary"] = summarize(text) or snippet or "Could not extract article text"
         except Exception as e:
+            log("request failed:", type(e).__name__, str(e)[:200])
             result["summary"] = f"Error: {type(e).__name__}: {str(e)[:200]}"
             return jsonify(result), 500
         finally:
