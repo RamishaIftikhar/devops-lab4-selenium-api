@@ -32,6 +32,11 @@ def make_driver():
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--no-zygote")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--remote-debugging-port=9222")
     opts.add_argument("--window-size=1366,768")
     opts.add_argument(
         "user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
